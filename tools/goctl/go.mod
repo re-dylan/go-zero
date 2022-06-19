@@ -15,4 +15,7 @@ require (
 	github.com/zeromicro/antlr v0.0.1
 	github.com/zeromicro/ddl-parser v1.0.3
 	github.com/zeromicro/go-zero v1.3.4
+	github.com/zeromicro/zero-api v0.0.0-20220420014836-769bc076c588
 )
+
+replace github.com/zeromicro/zero-api v0.0.0-20220420014836-769bc076c588 => github.com/re-dylan/zero-api v0.0.0-20220615163215-ec42e5ca681d

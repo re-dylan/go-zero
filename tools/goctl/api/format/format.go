@@ -1,29 +1,18 @@
 package format
 
 import (
-	"bufio"
 	"errors"
 	"fmt"
-	"go/format"
-	"go/scanner"
 	"io"
+	"io/fs"
 	"io/ioutil"
 	"os"
 	"path/filepath"
-	"strings"
+	"runtime"
 
 	"github.com/spf13/cobra"
 	"github.com/zeromicro/go-zero/core/errorx"
-	"github.com/zeromicro/go-zero/tools/goctl/api/parser"
-	"github.com/zeromicro/go-zero/tools/goctl/api/util"
-	"github.com/zeromicro/go-zero/tools/goctl/util/pathx"
-)
-
-const (
-	leftParenthesis  = "("
-	rightParenthesis = ")"
-	leftBrace        = "{"
-	rightBrace       = "}"
+	"github.com/zeromicro/zero-api/format"
 )
 
 var (
@@ -41,7 +30,7 @@ var (
 func GoFormatApi(_ *cobra.Command, _ []string) error {
 	var be errorx.BatchError
 	if VarBoolUseStdin {
-		if err := apiFormatReader(os.Stdin, VarStringDir, VarBoolSkipCheckDeclare); err != nil {
+		if err := processFile("<standard input>", nil, os.Stdin); err != nil {
 			be.Add(err)
 		}
 	} else {
@@ -55,10 +44,13 @@ func GoFormatApi(_ *cobra.Command, _ []string) error {
 		}
 
 		err = filepath.Walk(VarStringDir, func(path string, fi os.FileInfo, errBack error) (err error) {
-			if strings.HasSuffix(path, ".api") {
-				if err := ApiFormatByPath(path, VarBoolSkipCheckDeclare); err != nil {
-					be.Add(util.WrapErr(err, fi.Name()))
-				}
+			ext := filepath.Ext(path)
+			if ext != ".api" {
+				return nil
+			}
+
+			if err := processFile(path, fi, nil); err != nil {
+				be.Add(err)
 			}
 			return nil
 		})
@@ -66,176 +58,73 @@ func GoFormatApi(_ *cobra.Command, _ []string) error {
 	}
 
 	if be.NotNil() {
-		scanner.PrintError(os.Stderr, be.Err())
+		fmt.Fprint(os.Stderr, be.Err())
 		os.Exit(1)
 	}
 
 	return be.Err()
 }
 
-// apiFormatReader
-// filename is needed when there are `import` literals.
-func apiFormatReader(reader io.Reader, filename string, skipCheckDeclare bool) error {
-	data, err := ioutil.ReadAll(reader)
-	if err != nil {
-		return err
+func ApiFormatByPath(fileName string) error {
+	return processFile(fileName, nil, nil)
+}
+
+func processFile(fileName string, info fs.FileInfo, in io.Reader) error {
+	if in == nil {
+		var err error
+		in, err = os.Open(fileName)
+		if err != nil {
+			return err
+		}
 	}
-	result, err := apiFormat(string(data), skipCheckDeclare, filename)
+
+	src, err := ioutil.ReadAll(in)
 	if err != nil {
 		return err
 	}
 
-	_, err = fmt.Print(result)
+	res, err := format.Source(src, fileName)
+	if err != nil {
+		return err
+	}
+
+	// write to file
+	perm := info.Mode().Perm()
+	backName, err := backupFile(fileName+".", src, perm)
+	if err != nil {
+		return err
+	}
+
+	err = os.WriteFile(fileName, res, perm)
+	if err != nil {
+		_ = os.Rename(backName, fileName)
+		return err
+	}
+
+	err = os.Remove(backName)
 	return err
 }
 
-// ApiFormatByPath format api from file path
-func ApiFormatByPath(apiFilePath string, skipCheckDeclare bool) error {
-	data, err := ioutil.ReadFile(apiFilePath)
-	if err != nil {
-		return err
-	}
+const chmodSupported = runtime.GOOS != "windows"
 
-	abs, err := filepath.Abs(apiFilePath)
-	if err != nil {
-		return err
-	}
-
-	result, err := apiFormat(string(data), skipCheckDeclare, abs)
-	if err != nil {
-		return err
-	}
-
-	_, err = parser.ParseContentWithParserSkipCheckTypeDeclaration(result, abs)
-	if err != nil {
-		return err
-	}
-
-	return ioutil.WriteFile(apiFilePath, []byte(result), os.ModePerm)
-}
-
-func apiFormat(data string, skipCheckDeclare bool, filename ...string) (string, error) {
-	var err error
-	if skipCheckDeclare {
-		_, err = parser.ParseContentWithParserSkipCheckTypeDeclaration(data, filename...)
-	} else {
-		_, err = parser.ParseContent(data, filename...)
-	}
+func backupFile(filename string, data []byte, perm fs.FileMode) (string, error) {
+	f, err := os.CreateTemp(filepath.Dir(filename), filepath.Base(filename))
 	if err != nil {
 		return "", err
 	}
-
-	var builder strings.Builder
-	s := bufio.NewScanner(strings.NewReader(data))
-	tapCount := 0
-	newLineCount := 0
-	var preLine string
-	for s.Scan() {
-		line := strings.TrimSpace(s.Text())
-		if len(line) == 0 {
-			if newLineCount > 0 {
-				continue
-			}
-			newLineCount++
-		} else {
-			if preLine == rightBrace {
-				builder.WriteString(pathx.NL)
-			}
-			newLineCount = 0
-		}
-
-		if tapCount == 0 {
-			format, err := formatGoTypeDef(line, s, &builder)
-			if err != nil {
-				return "", err
-			}
-
-			if format {
-				continue
-			}
-		}
-
-		noCommentLine := util.RemoveComment(line)
-		if noCommentLine == rightParenthesis || noCommentLine == rightBrace {
-			tapCount--
-		}
-		if tapCount < 0 {
-			line := strings.TrimSuffix(noCommentLine, rightBrace)
-			line = strings.TrimSpace(line)
-			if strings.HasSuffix(line, leftBrace) {
-				tapCount++
-			}
-		}
-		util.WriteIndent(&builder, tapCount)
-		builder.WriteString(line + pathx.NL)
-		if strings.HasSuffix(noCommentLine, leftParenthesis) || strings.HasSuffix(noCommentLine, leftBrace) {
-			tapCount++
-		}
-		preLine = line
-	}
-
-	return strings.TrimSpace(builder.String()), nil
-}
-
-func formatGoTypeDef(line string, scanner *bufio.Scanner, builder *strings.Builder) (bool, error) {
-	noCommentLine := util.RemoveComment(line)
-	tokenCount := 0
-	if strings.HasPrefix(noCommentLine, "type") && (strings.HasSuffix(noCommentLine, leftParenthesis) ||
-		strings.HasSuffix(noCommentLine, leftBrace)) {
-		var typeBuilder strings.Builder
-		typeBuilder.WriteString(mayInsertStructKeyword(line, &tokenCount) + pathx.NL)
-		for scanner.Scan() {
-			noCommentLine := util.RemoveComment(scanner.Text())
-			typeBuilder.WriteString(mayInsertStructKeyword(scanner.Text(), &tokenCount) + pathx.NL)
-			if noCommentLine == rightBrace || noCommentLine == rightParenthesis {
-				tokenCount--
-			}
-			if tokenCount == 0 {
-				ts, err := format.Source([]byte(typeBuilder.String()))
-				if err != nil {
-					return false, errors.New("error format \n" + typeBuilder.String())
-				}
-
-				result := strings.ReplaceAll(string(ts), " struct ", " ")
-				result = strings.ReplaceAll(result, "type ()", "")
-				builder.WriteString(result)
-				break
-			}
-		}
-		return true, nil
-	}
-
-	return false, nil
-}
-
-func mayInsertStructKeyword(line string, token *int) string {
-	insertStruct := func() string {
-		if strings.Contains(line, " struct") {
-			return line
-		}
-		index := strings.Index(line, leftBrace)
-		return line[:index] + " struct " + line[index:]
-	}
-
-	noCommentLine := util.RemoveComment(line)
-	if strings.HasSuffix(noCommentLine, leftBrace) {
-		*token++
-		return insertStruct()
-	}
-	if strings.HasSuffix(noCommentLine, rightBrace) {
-		noCommentLine = strings.TrimSuffix(noCommentLine, rightBrace)
-		noCommentLine = util.RemoveComment(noCommentLine)
-		if strings.HasSuffix(noCommentLine, leftBrace) {
-			return insertStruct()
+	backname := f.Name()
+	if chmodSupported {
+		err := f.Chmod(perm)
+		if err != nil {
+			_ = f.Close()
+			_ = os.Remove(backname)
+			return backname, err
 		}
 	}
-	if strings.HasSuffix(noCommentLine, leftParenthesis) {
-		*token++
-	}
 
-	if strings.Contains(noCommentLine, "`") {
-		return util.UpperFirst(strings.TrimSpace(line))
+	_, err = f.Write(data)
+	if err1 := f.Close(); err1 != nil {
+		err = err1
 	}
-
-	return line
+	return backname, err
 }
